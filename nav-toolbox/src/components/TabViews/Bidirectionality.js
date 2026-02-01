@@ -48,9 +48,9 @@ const V_SENSE_RADIUS = 55;
 // Confidence threshold
 const CONF_THRESH = 0.40;
 
-// Motion params
-const SPEED = 90;      // px/sec
-const TURN_RATE = 3.5; // rad/sec
+// Motion params (slower)
+const SPEED = 62;      // px/sec (was 90)
+const TURN_RATE = 3.0; // rad/sec (was 3.5)
 
 // Modes (only two)
 const MODES = [
@@ -60,6 +60,30 @@ const MODES = [
 
 // For stubborn weak-prior dithering
 const STUB_DITHER_PERIOD = 1.6;
+
+// ---------- Demo script ----------
+const DEMO_GOAL_RADIUS = 16;
+const DEMO_HOLD_AFTER_GOAL = 1.8;
+
+// Two phases only
+const DEMO = [
+  {
+    prior: 'STRONG_WRONG',
+    mode: 'STUBBORN',
+    title: 'No bidirectionality (stubborn)',
+    line: 'Strong wrong prior → commits to L2 and ignores evidence.',
+    result: 'Result: ends at L2 (wrong) and never corrects.',
+    goal: 'L2',
+  },
+  {
+    prior: 'STRONG_WRONG',
+    mode: 'BIDIR',
+    title: 'Bidirectional perception–action loop',
+    line: 'Verify at V → update belief → reach L1 even with a wrong prior.',
+    result: 'Result: ends at L1 (correct) after updating at V.',
+    goal: 'L1',
+  },
+];
 
 export default function Bidirectionality() {
   const [priorMode, setPriorMode] = useState('WEAK'); // WEAK | STRONG_CORRECT | STRONG_WRONG
@@ -73,6 +97,12 @@ export default function Bidirectionality() {
   const [measInfo, setMeasInfo] = useState(null); // {meas,sigma,pred1,pred2,err1,err2,winner,inVantage}
   const [tElapsed, setTElapsed] = useState(0);
 
+  // Demo UI
+  const [demoEnabled, setDemoEnabled] = useState(true);
+  const [demoTitle, setDemoTitle] = useState('');
+  const [demoLine, setDemoLine] = useState('');
+  const [demoPhase, setDemoPhase] = useState(0);
+
   // refs for stable loop
   const robotRef = useRef(robot);
   const beliefRef = useRef(belief);
@@ -81,6 +111,7 @@ export default function Bidirectionality() {
   const runningRef = useRef(running);
   const actionRef = useRef(action);
   const measRef = useRef(measInfo);
+  const demoEnabledRef = useRef(demoEnabled);
 
   const elapsedRef = useRef(0);
   const senseTimerRef = useRef(0);
@@ -89,6 +120,12 @@ export default function Bidirectionality() {
   const stubTimerRef = useRef(0);
   const stubSideRef = useRef(0); // 0 -> L1, 1 -> L2
 
+  // Verification latch for BIDIR (forces “go to V first” so the loop is visible)
+  const verifyRef = useRef({ needsVerify: true });
+
+  // Demo progression refs
+  const demoRef = useRef({ phase: 0, reached: false, hold: 0 });
+
   useEffect(() => { robotRef.current = robot; }, [robot]);
   useEffect(() => { beliefRef.current = belief; }, [belief]);
   useEffect(() => { priorRef.current = priorMode; }, [priorMode]);
@@ -96,11 +133,13 @@ export default function Bidirectionality() {
   useEffect(() => { runningRef.current = running; }, [running]);
   useEffect(() => { actionRef.current = action; }, [action]);
   useEffect(() => { measRef.current = measInfo; }, [measInfo]);
+  useEffect(() => { demoEnabledRef.current = demoEnabled; }, [demoEnabled]);
 
   const computeInitialBelief = (mode) => {
     if (mode === 'WEAK') return [0.5, 0.5];
     if (mode === 'STRONG_CORRECT') return [0.9, 0.1];
-    return [0.1, 0.9]; // STRONG_WRONG
+    // Strong wrong but recoverable
+    return [0.15, 0.85];
   };
 
   const reset = useCallback((newPrior = priorRef.current, newSimMode = simModeRef.current) => {
@@ -130,16 +169,15 @@ export default function Bidirectionality() {
     elapsedRef.current = 0;
     senseTimerRef.current = 0;
 
-    // randomize which way “stubborn-weak” starts dithering (feels less arbitrary than always L2)
+    // reset verification latch
+    verifyRef.current = { needsVerify: true };
+
+    // randomize which way “stubborn-weak” starts dithering
     stubTimerRef.current = 0;
     stubSideRef.current = (Math.random() < 0.5) ? 0 : 1;
 
     setTElapsed(0);
   }, []);
-
-  useEffect(() => {
-    reset('WEAK', 'BIDIR'); // start paused
-  }, [reset]);
 
   const start = useCallback(() => {
     setRunning(true);
@@ -150,6 +188,24 @@ export default function Bidirectionality() {
     setRunning(false);
     runningRef.current = false;
   }, []);
+
+  const beginDemoPhase = useCallback((idx) => {
+    const phase = DEMO[idx];
+
+    demoRef.current = { phase: idx, reached: false, hold: 0 };
+    setDemoPhase(idx);
+    setDemoTitle(phase.title);
+    setDemoLine(phase.line);
+
+    reset(phase.prior, phase.mode);
+    start();
+  }, [reset, start]);
+
+  // Start in demo mode: stubborn + strong wrong prior
+  useEffect(() => {
+    if (demoEnabled) beginDemoPhase(0);
+    else reset('WEAK', 'BIDIR');
+  }, [demoEnabled, beginDemoPhase, reset]);
 
   useGameLoop((dtMs) => {
     if (!runningRef.current) return;
@@ -172,8 +228,11 @@ export default function Bidirectionality() {
     let nextAction = 'GO_TO_V (active localization)';
 
     if (mode === 'BIDIR') {
-      // Bidirectional: if uncertain -> go to V; if confident -> go to argmax landmark
-      if (confident) {
+      // Verify at V once, then commit.
+      if (verifyRef.current.needsVerify) {
+        target = VANTAGE;
+        nextAction = 'GO_TO_V (verify)';
+      } else if (confident) {
         target = (w1 >= w2) ? L1 : L2;
         nextAction = (w1 >= w2) ? 'GO_TO_L1 (belief commit)' : 'GO_TO_L2 (belief commit)';
       } else {
@@ -183,8 +242,7 @@ export default function Bidirectionality() {
     }
 
     if (mode === 'STUBBORN') {
-      // Stubborn: never updates belief, but action policy can still react to the PRIOR.
-      // Strong priors commit; weak prior dithers between L1 and L2 (illustrates indecision without learning).
+      // Stubborn: never updates belief, action follows the prior.
       if (priorRef.current === 'STRONG_CORRECT') {
         target = L1;
         nextAction = 'GO_TO_L1 (stubborn prior)';
@@ -192,7 +250,7 @@ export default function Bidirectionality() {
         target = L2;
         nextAction = 'GO_TO_L2 (stubborn prior)';
       } else {
-        // WEAK: dither forever because nothing will ever resolve it
+        // WEAK: dither forever
         stubTimerRef.current += dt;
         if (stubTimerRef.current > STUB_DITHER_PERIOD) {
           stubTimerRef.current = 0;
@@ -234,13 +292,13 @@ export default function Bidirectionality() {
     const dV = Math.hypot(VANTAGE.x - r.x, VANTAGE.y - r.y);
     const inVantage = dV <= V_SENSE_RADIUS;
 
-    // Only BIDIR updates belief; STUBBORN never updates belief
+    // Only BIDIR updates belief
     const allowBottomUp = (mode !== 'STUBBORN');
 
     senseTimerRef.current += dt;
     const SENSE_PERIOD = 0.35;
 
-    // In BIDIR: update ONLY at V (gated sensing)
+    // In BIDIR: update ONLY at V
     const shouldSense =
       allowBottomUp &&
       senseTimerRef.current >= SENSE_PERIOD &&
@@ -267,8 +325,8 @@ export default function Bidirectionality() {
       const lh1 = Math.exp(-0.5 * (err1 / sigma) * (err1 / sigma));
       const lh2 = Math.exp(-0.5 * (err2 / sigma) * (err2 / sigma));
 
-      // Temper updates so belief doesn’t snap instantly
-      const alpha = 0.70;
+      // Temper updates
+      const alpha = 0.85;
       let nw1 = b[0] * Math.pow(lh1, alpha);
       let nw2 = b[1] * Math.pow(lh2, alpha);
       const s = nw1 + nw2;
@@ -277,6 +335,12 @@ export default function Bidirectionality() {
         nw1 /= s;
         nw2 /= s;
         b = [nw1, nw2];
+      }
+
+      // Once we’ve sensed at V and become confident, allow commitment
+      const nowConfident = Math.abs(b[0] - b[1]) >= CONF_THRESH;
+      if (mode === 'BIDIR' && verifyRef.current.needsVerify && nowConfident) {
+        verifyRef.current.needsVerify = false;
       }
 
       const winner = (err1 <= err2) ? 'H1 (Near L1)' : 'H2 (Near L2)';
@@ -301,8 +365,35 @@ export default function Bidirectionality() {
     elapsedRef.current += dt;
     setTElapsed(elapsedRef.current);
 
-    // Auto loop
-    if (elapsedRef.current > 28) {
+    // -----------------------------
+    // Demo progression (2 phases)
+    // -----------------------------
+    if (demoEnabledRef.current) {
+      const idx = demoRef.current.phase;
+      const phase = DEMO[idx];
+
+      const dL1 = Math.hypot(L1.x - r.x, L1.y - r.y);
+      const dL2 = Math.hypot(L2.x - r.x, L2.y - r.y);
+      const dGoal = (phase.goal === 'L1') ? dL1 : dL2;
+
+      if (!demoRef.current.reached && dGoal <= DEMO_GOAL_RADIUS) {
+        demoRef.current.reached = true;
+        demoRef.current.hold = 0;
+        setDemoLine(phase.result);
+      }
+
+      if (demoRef.current.reached) {
+        demoRef.current.hold += dt;
+        if (demoRef.current.hold >= DEMO_HOLD_AFTER_GOAL) {
+          const next = (idx + 1) % DEMO.length;
+          beginDemoPhase(next);
+          return;
+        }
+      }
+    }
+
+    // Safety auto loop when NOT in demo
+    if (!demoEnabledRef.current && elapsedRef.current > 28) {
       reset(priorRef.current, simModeRef.current);
     }
   });
@@ -328,14 +419,75 @@ export default function Bidirectionality() {
   const modeLabel = MODES.find(m => m.id === simMode)?.label ?? simMode;
   const inVantageNow = (Math.hypot(VANTAGE.x - robot.x, VANTAGE.y - robot.y) <= V_SENSE_RADIUS);
 
+  const demoOverlay = demoEnabled && (demoTitle || demoLine);
+
+  // Floating bottom-right controls for demo entry / restart
+  const DemoDock = html`
+    <div style="
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      padding: 8px;
+      border-radius: 12px;
+      background: rgba(2, 6, 23, 0.82);
+      border: 1px solid rgba(148,163,184,0.22);
+      backdrop-filter: blur(6px);
+      z-index: 20;
+      ">
+      <button class="control-btn ${running ? '' : 'active'}" onClick=${running ? pause : start}>
+        ${running ? 'Pause' : 'Run'}
+      </button>
+
+      ${demoEnabled
+      ? html`
+            <button class="control-btn" onClick=${() => beginDemoPhase(0)}>
+              Restart demo
+            </button>
+            <button class="control-btn active" onClick=${() => setDemoEnabled(false)}>
+              Exit demo
+            </button>
+          `
+      : html`
+            <button class="control-btn active" onClick=${() => setDemoEnabled(true)}>
+              Start demo
+            </button>
+          `}
+    </div>
+  `;
+
   return html`
-    <div class="split-view" style="flex-direction: column; height: 100%;">
+    <div class="split-view" style="flex-direction: column; height: 100%; position: relative;">
+      ${DemoDock}
+
       <div style="flex: 1; display: flex; min-height: 0;">
         <!-- LEFT: WORLD -->
         <div style="flex: 2; border-right: 1px solid #334155; position: relative; background: #020617;">
           <div style="position:absolute; top:5px; left:5px; color:#94a3b8; font-size:10px; font-weight:bold;">
             PHYSICAL WORLD
           </div>
+
+          ${demoOverlay && html`
+            <div style="
+              position:absolute;
+              left:12px; right:12px; bottom:12px;
+              background: rgba(2, 6, 23, 0.78);
+              border: 1px solid rgba(148,163,184,0.22);
+              border-radius: 12px;
+              padding: 12px 14px;
+              color: #e2e8f0;
+              backdrop-filter: blur(4px);
+              ">
+              <div style="font-size:14px; font-weight:800; color:#facc15; margin-bottom:6px;">
+                ${demoTitle}
+              </div>
+              <div style="font-size:13px; line-height:1.35; color:#cbd5e1;">
+                ${demoLine}
+              </div>
+            </div>
+          `}
 
           <svg viewBox="0 0 400 300" style="width: 100%; height: 100%;">
             <!-- Landmarks -->
@@ -417,6 +569,15 @@ export default function Bidirectionality() {
             <div style="margin-top: 10px; font-size: 11px; color: #94a3b8;">
               Status: <strong style="color:${resolved ? '#4ade80' : '#facc15'};">${resolved ? 'RESOLVED' : 'AMBIGUOUS'}</strong>
             </div>
+
+            ${simMode === 'BIDIR' && html`
+              <div style="margin-top: 10px; font-size: 11px; color: #cbd5e1;">
+                <strong>Verify-first:</strong>
+                <span style="color:${verifyRef.current.needsVerify ? '#facc15' : '#4ade80'};">
+                  ${verifyRef.current.needsVerify ? 'ON (go to V)' : 'DONE'}
+                </span>
+              </div>
+            `}
           </div>
 
           <div style="flex: 1; padding: 10px; background: #0f172a; display:flex; flex-direction:column; justify-content:center;">
@@ -428,44 +589,17 @@ export default function Bidirectionality() {
               <div><strong>Association winner:</strong> <span style="color:#facc15;">${measInfo ? measInfo.winner : '—'}</span></div>
               <div><strong>σ:</strong> ${measInfo ? measInfo.sigma.toFixed(3) : '—'} rad</div>
               <div><strong>Time:</strong> ${tElapsed.toFixed(1)}s</div>
+              ${demoEnabled && html`<div><strong>Demo phase:</strong> ${demoPhase + 1} / ${DEMO.length}</div>`}
             </div>
           </div>
         </div>
       </div>
 
-      <!-- Controls -->
-      <div class="controls" style="gap:8px; flex-wrap: wrap;">
-        <button class="control-btn ${running ? '' : 'active'}" onClick=${running ? pause : start}>
-          ${running ? 'Pause' : 'Run'}
-        </button>
-
-        <button class="control-btn" onClick=${() => reset(priorRef.current, simModeRef.current)}>
-          Reset (pause)
-        </button>
-
-        <div style="width:1px; background:#334155; margin:0 10px;"></div>
-
-        <small style="color:#94a3b8; align-self:center; margin-right:6px;">Prior:</small>
-        <button class="control-btn ${priorMode === 'WEAK' ? 'active' : ''}" onClick=${() => reset('WEAK', simModeRef.current)}>Weak</button>
-        <button class="control-btn ${priorMode === 'STRONG_CORRECT' ? 'active' : ''}" onClick=${() => reset('STRONG_CORRECT', simModeRef.current)}>Strong Correct</button>
-        <button class="control-btn ${priorMode === 'STRONG_WRONG' ? 'active' : ''}" onClick=${() => reset('STRONG_WRONG', simModeRef.current)}>Strong Wrong</button>
-
-        <div style="width:1px; background:#334155; margin:0 10px;"></div>
-
-        <small style="color:#94a3b8; align-self:center; margin-right:6px;">Mode:</small>
-        ${MODES.map(m => html`
-          <button class="control-btn ${simMode === m.id ? 'active' : ''}"
-                  onClick=${() => reset(priorRef.current, m.id)}>
-            ${m.label}
-          </button>
-        `)}
-      </div>
-
-      <div class="caption-area" style="min-height: 140px;">
-        <h3>Bidirectionality (loop vs no-loop)</h3>
-        <ul>
-          <li><strong>Bidirectional:</strong> belief → action (go to V when unsure), then V → measurement → belief update → plan can flip.</li>
-          <li><strong>Stubborn:</strong> action ignores evidence. With <strong>Weak</strong> prior it dithers forever; with <strong>Strong Wrong</strong> it goes confidently to the wrong goal.</li>
+      <div class="caption-area" style="min-height: 110px;">
+        <h3 style="margin-bottom:6px;">Bidirectionality (loop vs no-loop)</h3>
+        <ul style="margin-top:0;">
+          <li><strong>Stubborn:</strong> top-down action follows the prior; no bottom-up correction.</li>
+          <li><strong>Bidirectional:</strong> action goes to a vantage point, sensing updates belief, belief updates action.</li>
         </ul>
       </div>
     </div>
